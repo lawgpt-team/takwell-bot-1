@@ -64,6 +64,17 @@ function buildIntroBlocks(): KnownBlock[] {
   ];
 }
 
+// blocks가 있을 때 text 필드는 알림/스크린리더용 fallback 요약이라 짧게 써야 한다.
+// 본문 전체를 그대로 넣으면 chat.update에서 msg_too_long 에러가 발생한다.
+function notificationText(briefingText: string, isBriefingComplete: boolean): string {
+  if (isBriefingComplete) {
+    return "📋 사건 브리핑이 도착했습니다.";
+  }
+  const collapsed = briefingText.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= 200) return collapsed;
+  return collapsed.slice(0, 200) + "…";
+}
+
 function chunkText(text: string, size: number): string[] {
   if (text.length <= size) return [text];
   const chunks: string[] = [];
@@ -177,7 +188,7 @@ async function runInitialIntake(context: IntakeRunContext): Promise<void> {
     await context.client.chat.update({
       channel: context.channelId,
       ts: loading.ts!,
-      text: result.text,
+      text: notificationText(result.text, result.isBriefingComplete),
       blocks,
     });
   } catch (error) {
@@ -372,7 +383,7 @@ export function registerHandlers(app: App): void {
         await client.chat.update({
           channel: channelId,
           ts: loading.ts!,
-          text: result.text,
+          text: notificationText(result.text, result.isBriefingComplete),
           blocks,
         });
       } catch (error) {
