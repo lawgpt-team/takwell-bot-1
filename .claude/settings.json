@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install*)",
+      "Bash(npm run*)",
+      "Bash(npx drizzle-kit*)",
+      "Bash(npx tsx*)",
+      "Bash(npx tsc*)",
+      "Bash(cat .env*)",
+      "Bash(head*)",
+      "Bash(tail*)",
+      "Bash(grep*)",
+      "Bash(ls*)",
+      "Bash(find*)",
+      "Bash(mkdir*)",
+      "Bash(wc*)",
+      "Bash(git status*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git log*)",
+      "Bash(git diff*)"
+    ]
+  }
+}
