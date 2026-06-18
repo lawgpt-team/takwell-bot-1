@@ -1,8 +1,17 @@
 import type { App } from "@slack/bolt";
-import type { KnownBlock } from "@slack/web-api";
+import type { KnownBlock, ModalView } from "@slack/web-api";
 import { classifyMessage, runIntake, type IntakeStep, type Message } from "../ai/engine.js";
 import { getSession, saveSession, deleteSession, type SessionKey } from "../services/sessions.js";
-import { createRequest, type RequestType } from "../services/requests.js";
+import {
+  appendClientMessage,
+  createRequest,
+  findRequestByThread,
+  updateRequestContact,
+  type Request,
+  type RequestType,
+} from "../services/requests.js";
+import { getContact, upsertContact } from "../services/contacts.js";
+import { buildHomeView } from "../workflows/onboarding.js";
 
 // Slack section 블록은 텍스트 3000자 한도 — 안전 마진을 두고 2800자로 자른다.
 const SECTION_BLOCK_LIMIT = 2800;
@@ -64,13 +73,18 @@ function chunkText(text: string, size: number): string[] {
   return chunks;
 }
 
-function buildResultBlocks(text: string, isBriefingComplete: boolean): KnownBlock[] {
+// requestId는 브리핑 완성 후 "연락처 남기기" 버튼이 어떤 사건과 연결되는지 식별하는 키.
+function buildResultBlocks(
+  text: string,
+  isBriefingComplete: boolean,
+  requestId?: string,
+): KnownBlock[] {
   const sections: KnownBlock[] = chunkText(text, SECTION_BLOCK_LIMIT).map((chunk) => ({
     type: "section",
     text: { type: "mrkdwn", text: chunk },
   }));
 
-  if (isBriefingComplete) {
+  if (isBriefingComplete && requestId) {
     sections.push(
       {
         type: "section",
@@ -86,12 +100,13 @@ function buildResultBlocks(text: string, isBriefingComplete: boolean): KnownBloc
             type: "button",
             text: { type: "plain_text", text: "연락처 남기기" },
             action_id: "open_contact_modal",
+            value: requestId,
             style: "primary",
           },
         ],
       },
     );
-  } else {
+  } else if (!isBriefingComplete) {
     sections.push({
       type: "context",
       elements: [
@@ -124,7 +139,7 @@ type IntakeRunContext = {
   client: any;
 };
 
-// 첫 멘션에서 사건 접수를 시작한다. 로딩 메시지 → AI 호출 → 결과로 교체.
+// 첫 멘션에서 사건 접수를 시작한다. 로딩 메시지 → AI 호출 → (완성이면 사건 저장 후) 결과로 교체.
 async function runInitialIntake(context: IntakeRunContext): Promise<void> {
   const loading = await context.client.chat.postMessage({
     channel: context.channelId,
@@ -136,28 +151,19 @@ async function runInitialIntake(context: IntakeRunContext): Promise<void> {
     const step = classifyMessage(context.initialText);
     const messages: Message[] = [{ role: "user", content: context.initialText }];
     const result = await runIntake(step, messages);
-
-    const blocks = buildResultBlocks(result.text, result.isBriefingComplete);
-
-    await context.client.chat.update({
-      channel: context.channelId,
-      ts: loading.ts!,
-      text: result.text,
-      blocks,
-    });
-
     const sessionKey: SessionKey = { teamId: context.teamId, threadTs: context.threadTs };
 
+    let requestId: string | undefined;
     if (result.isBriefingComplete) {
-      // 빠른 질문/계약서 검토 등으로 첫 응답에서 브리핑이 바로 완성된 경우
-      const summary = context.initialText.slice(0, 200);
-      await createRequest({
+      // 브리핑이 완성되면 먼저 사건을 저장해서 requestId를 확보해야
+      // "연락처 남기기" 버튼이 어떤 사건과 연결되는지 알 수 있다.
+      requestId = await createRequest({
         type: stepToRequestType(step),
         slackChannelId: context.channelId,
         slackThreadTs: context.threadTs,
         teamId: context.teamId,
         requestedBy: context.userId,
-        summary,
+        summary: context.initialText.slice(0, 200),
         aiAnalysis: result.text,
       });
       await deleteSession(sessionKey);
@@ -166,6 +172,14 @@ async function runInitialIntake(context: IntakeRunContext): Promise<void> {
       messages.push({ role: "assistant", content: result.text });
       await saveSession(sessionKey, messages);
     }
+
+    const blocks = buildResultBlocks(result.text, result.isBriefingComplete, requestId);
+    await context.client.chat.update({
+      channel: context.channelId,
+      ts: loading.ts!,
+      text: result.text,
+      blocks,
+    });
   } catch (error) {
     await context.client.chat.update({
       channel: context.channelId,
@@ -177,6 +191,89 @@ async function runInitialIntake(context: IntakeRunContext): Promise<void> {
   }
 }
 
+// 브리핑이 완성된 사건의 스레드에서 새 메시지가 들어왔을 때.
+// 활성 사건이 있으면 status별 안내를 보내고, 어떤 경우든 의뢰인 메시지를 로그에 누적한다.
+async function handlePostBriefingMessage(args: {
+  channelId: string;
+  threadTs: string;
+  text: string;
+  client: any;
+}): Promise<void> {
+  const request = await findRequestByThread(args.channelId, args.threadTs);
+  if (!request) return;
+
+  // 사건 로그에 의뢰인 메시지 누적 (변호사가 나중에 확인할 수 있도록)
+  await appendClientMessage(request.id, args.text);
+
+  const reply = buildPostBriefingReply(request);
+  await args.client.chat.postMessage({
+    channel: args.channelId,
+    thread_ts: args.threadTs,
+    text: reply,
+  });
+}
+
+function buildPostBriefingReply(request: Request): string {
+  switch (request.status) {
+    case "completed":
+      return "✅ 이 사건은 종료되었습니다. 새로운 문의는 채널에서 다시 `@탁월`을 멘션해 주세요.";
+    case "contacted":
+      return "✉️ 변호사 답변은 등록하신 연락처로 발송됩니다. 추가하신 내용은 사건 기록에 함께 저장해 두었어요.";
+    default:
+      // pending / lawyer_review
+      return "📌 보충 정보가 변호사에게 전달되었습니다. 답변이 준비되는 대로 다시 안내드릴게요.";
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// 연락처 모달
+// ────────────────────────────────────────────────────────────
+
+type ContactModalMetadata = {
+  requestId: string;
+  channelId: string;
+  threadTs: string;
+  teamId: string;
+};
+
+const CONTACT_BLOCK_ID = "contact_block";
+const CONTACT_INPUT_ACTION_ID = "contact_input";
+
+function buildContactModal(metadata: ContactModalMetadata, prefilledContact: string | null): ModalView {
+  const inputElement: any = {
+    type: "plain_text_input",
+    action_id: CONTACT_INPUT_ACTION_ID,
+    placeholder: { type: "plain_text", text: "name@example.com 또는 010-1234-5678" },
+  };
+  if (prefilledContact) {
+    inputElement.initial_value = prefilledContact;
+  }
+
+  return {
+    type: "modal",
+    callback_id: "contact_modal_submit",
+    private_metadata: JSON.stringify(metadata),
+    title: { type: "plain_text", text: "연락처 남기기" },
+    submit: { type: "plain_text", text: "저장" },
+    close: { type: "plain_text", text: "취소" },
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "변호사가 답변드릴 *이메일* 또는 *전화번호*를 남겨주세요.",
+        },
+      },
+      {
+        type: "input",
+        block_id: CONTACT_BLOCK_ID,
+        label: { type: "plain_text", text: "연락처" },
+        element: inputElement,
+      },
+    ],
+  };
+}
+
 export function registerHandlers(app: App): void {
   // ────────────────────────────────────────────────────────────
   // 1. 사건 접수 시작 (app_mention)
@@ -186,7 +283,6 @@ export function registerHandlers(app: App): void {
       const rawText = (event as any).text ?? "";
       const cleanedText = stripMention(rawText);
       const channelId = event.channel;
-      // app_mention은 thread_ts가 없을 수 있다 (탑레벨 멘션 → ts 자체가 스레드 시작점)
       const threadTs = (event as any).thread_ts ?? event.ts;
       const teamId = (event as any).team ?? context.teamId ?? "unknown";
       const userId = (event as any).user;
@@ -215,17 +311,14 @@ export function registerHandlers(app: App): void {
   });
 
   // ────────────────────────────────────────────────────────────
-  // 2. 스레드 후속 대화 (message)
+  // 2. 스레드 메시지 (인테이크 진행 중 또는 사후 메시지)
   // ────────────────────────────────────────────────────────────
   app.message(async ({ message, client, context, logger }) => {
     try {
       const anyMessage = message as any;
 
-      // 봇 자신의 메시지는 무시
       if (anyMessage.bot_id) return;
-      // 스레드 안에서만 동작 (탑레벨 메시지는 무시)
       if (!anyMessage.thread_ts) return;
-      // 일반 텍스트 메시지만 처리 (subtype이 있으면 시스템 메시지나 변경 알림이므로 무시)
       if (anyMessage.subtype && anyMessage.subtype !== "file_share") return;
 
       const text: string = anyMessage.text ?? "";
@@ -239,9 +332,13 @@ export function registerHandlers(app: App): void {
       const sessionKey: SessionKey = { teamId, threadTs };
       const session = await getSession(sessionKey);
 
-      // 세션이 없으면 인테이크 중인 스레드가 아니다 → 일단 무시 (post-briefing 처리는 별도)
-      if (!session) return;
+      if (!session) {
+        // 세션이 없는 스레드 — 브리핑이 이미 완성된 사건인지 확인하고 사후 메시지로 처리
+        await handlePostBriefingMessage({ channelId, threadTs, text, client });
+        return;
+      }
 
+      // 인테이크 진행 중 — step2로 대화를 이어간다
       const loading = await client.chat.postMessage({
         channel: channelId,
         thread_ts: threadTs,
@@ -252,18 +349,11 @@ export function registerHandlers(app: App): void {
         const updatedMessages: Message[] = [...session, { role: "user", content: text }];
         const result = await runIntake("step2", updatedMessages);
 
-        const blocks = buildResultBlocks(result.text, result.isBriefingComplete);
-        await client.chat.update({
-          channel: channelId,
-          ts: loading.ts!,
-          text: result.text,
-          blocks,
-        });
-
+        let requestId: string | undefined;
         if (result.isBriefingComplete) {
           const firstUserMessage =
             updatedMessages.find((entry) => entry.role === "user")?.content ?? "";
-          await createRequest({
+          requestId = await createRequest({
             type: "legal_question",
             slackChannelId: channelId,
             slackThreadTs: threadTs,
@@ -277,6 +367,14 @@ export function registerHandlers(app: App): void {
           updatedMessages.push({ role: "assistant", content: result.text });
           await saveSession(sessionKey, updatedMessages);
         }
+
+        const blocks = buildResultBlocks(result.text, result.isBriefingComplete, requestId);
+        await client.chat.update({
+          channel: channelId,
+          ts: loading.ts!,
+          text: result.text,
+          blocks,
+        });
       } catch (error) {
         await client.chat.update({
           channel: channelId,
@@ -292,7 +390,7 @@ export function registerHandlers(app: App): void {
   });
 
   // ────────────────────────────────────────────────────────────
-  // 3. 예시 버튼 클릭 (example_unpaid / example_contract / example_worker)
+  // 3. 예시 버튼 클릭
   // ────────────────────────────────────────────────────────────
   for (const actionId of Object.keys(EXAMPLE_PROMPTS)) {
     app.action(actionId, async ({ ack, body, client, logger }) => {
@@ -311,7 +409,6 @@ export function registerHandlers(app: App): void {
           return;
         }
 
-        // 의뢰인이 직접 텍스트를 입력한 것처럼 보이도록 먼저 스레드에 표시
         await client.chat.postMessage({
           channel: channelId,
           thread_ts: threadTs,
@@ -331,4 +428,101 @@ export function registerHandlers(app: App): void {
       }
     });
   }
+
+  // ────────────────────────────────────────────────────────────
+  // 4. 연락처 모달 열기
+  // ────────────────────────────────────────────────────────────
+  app.action("open_contact_modal", async ({ ack, body, client, logger }) => {
+    await ack();
+    try {
+      const actionBody = body as any;
+      const triggerId = actionBody.trigger_id;
+      const requestId = actionBody.actions?.[0]?.value;
+      const channelId = actionBody.channel?.id ?? actionBody.container?.channel_id;
+      const threadTs =
+        actionBody.message?.thread_ts ?? actionBody.message?.ts ?? actionBody.container?.message_ts;
+      const teamId = actionBody.team?.id ?? "unknown";
+      const userId = actionBody.user?.id;
+
+      if (!triggerId || !requestId || !channelId || !threadTs || !userId) {
+        logger.warn("연락처 모달: 필요한 컨텍스트 누락", {
+          triggerId,
+          requestId,
+          channelId,
+          threadTs,
+          userId,
+        });
+        return;
+      }
+
+      // 이전에 남긴 연락처가 있으면 모달에 미리 채워둔다
+      const existingContact = await getContact({ slackUserId: userId, teamId });
+
+      const metadata: ContactModalMetadata = {
+        requestId,
+        channelId,
+        threadTs,
+        teamId,
+      };
+
+      await client.views.open({
+        trigger_id: triggerId,
+        view: buildContactModal(metadata, existingContact),
+      });
+    } catch (error) {
+      logger.error("연락처 모달 열기 중 오류:", error);
+    }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // 5. 연락처 모달 제출
+  // ────────────────────────────────────────────────────────────
+  app.view("contact_modal_submit", async ({ ack, body, view, client, logger }) => {
+    try {
+      const rawContact =
+        view.state.values[CONTACT_BLOCK_ID]?.[CONTACT_INPUT_ACTION_ID]?.value ?? "";
+      const contact = rawContact.trim();
+
+      if (!contact) {
+        await ack({
+          response_action: "errors",
+          errors: { [CONTACT_BLOCK_ID]: "연락처를 입력해주세요." },
+        });
+        return;
+      }
+
+      await ack();
+
+      const metadata = JSON.parse(view.private_metadata) as ContactModalMetadata;
+      const userId = body.user.id;
+
+      await upsertContact({ slackUserId: userId, teamId: metadata.teamId }, contact);
+      await updateRequestContact(metadata.requestId, contact);
+
+      await client.chat.postMessage({
+        channel: metadata.channelId,
+        thread_ts: metadata.threadTs,
+        text: `✅ 연락처가 저장되었습니다 (${contact}). 변호사가 곧 답변드릴게요.`,
+      });
+    } catch (error) {
+      logger.error("연락처 모달 제출 중 오류:", error);
+    }
+  });
+
+  // ────────────────────────────────────────────────────────────
+  // 6. 홈탭 온보딩
+  // ────────────────────────────────────────────────────────────
+  app.event("app_home_opened", async ({ event, client, logger }) => {
+    // app_home_opened는 messages 탭 진입 시에도 발생 — home 탭에서만 publish
+    if ((event as any).tab !== "home") return;
+
+    try {
+      await client.views.publish({
+        user_id: event.user,
+        view: buildHomeView(),
+      });
+    } catch (error) {
+      logger.error("홈탭 publish 중 오류:", error);
+    }
+  });
 }
