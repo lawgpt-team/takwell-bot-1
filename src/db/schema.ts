@@ -51,11 +51,18 @@ export const installations = pgTable("installations", {
   installedAt: timestamp("installed_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const sessions = pgTable("sessions", {
-  threadTs: text("thread_ts").primaryKey(),
-  messages: text("messages").notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const sessions = pgTable(
+  "sessions",
+  {
+    teamId: text("team_id").notNull(),
+    threadTs: text("thread_ts").notNull(),
+    messages: text("messages").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.teamId, table.threadTs] }),
+  }),
+);
 
 export const userContacts = pgTable(
   "user_contacts",

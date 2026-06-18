@@ -1,5 +1,6 @@
 import { App, ExpressReceiver, LogLevel } from "@slack/bolt";
 import { installationStore } from "../services/installations.js";
+import { registerHandlers } from "./handlers.js";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -53,3 +54,6 @@ export const app = new App({
 receiver.router.get("/health", (_request, response) => {
   response.status(200).send("ok");
 });
+
+// 이벤트/액션 핸들러 등록
+registerHandlers(app);
