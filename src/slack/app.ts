@@ -37,12 +37,13 @@ export const receiver = new ExpressReceiver({
     // 기본 redirect URI: <host>/slack/oauth_redirect
     // Slack 앱 설정의 OAuth & Permissions에 동일하게 등록해야 한다.
   },
-  endpoints: {
-    events: "/slack/events",
-    commands: "/slack/commands",
-    actions: "/slack/actions",
-    options: "/slack/options",
-  },
+  // 이벤트 / 인터랙티브 컴포넌트 / 슬래시 명령어 / 옵션 페이로드를 모두
+  // 같은 엔드포인트로 받는다. Bolt가 페이로드의 type 필드를 보고 라우팅한다.
+  // Slack 앱 설정의 다음 URL을 모두 동일하게 맞춰야 한다:
+  //   - Event Subscriptions Request URL
+  //   - Interactivity & Shortcuts Request URL
+  //   - Slash Commands Request URL (사용 시)
+  endpoints: "/slack/events",
 });
 
 export const app = new App({
