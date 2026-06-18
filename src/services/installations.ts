@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import type { Installation, InstallationQuery, InstallationStore } from "@slack/bolt";
 import { db } from "../db/index.js";
 import { installations } from "../db/schema.js";
+import { sendWelcomeDM } from "../workflows/onboarding.js";
 
 // CLAUDE.md 스키마는 enterprise install을 지원하지 않으므로
 // team 단위 설치만 처리한다. 엔터프라이즈 그리드 설치는 별도 작업으로 분리.
@@ -43,6 +44,14 @@ export const installationStore: InstallationStore = {
           installedAt: new Date(),
         },
       });
+
+    // 설치한 사용자에게 환영 DM 발송. 실패해도 설치 자체는 성공으로 처리한다
+    // (DM이 차단되어도 봇 자체는 정상 동작해야 하므로).
+    try {
+      await sendWelcomeDM({ botToken, userId: installation.user.id });
+    } catch (error) {
+      console.error("설치 환영 DM 발송 실패:", error);
+    }
   },
 
   async fetchInstallation(query: InstallationQuery<boolean>): Promise<Installation> {
